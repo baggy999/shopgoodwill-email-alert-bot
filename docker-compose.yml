@@ -1,0 +1,13 @@
+services:
+  shopgoodwill-alert-bot:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - shopgoodwill-alert-data:/data
+    ports:
+      - "8080:8080"
+
+volumes:
+  shopgoodwill-alert-data:
