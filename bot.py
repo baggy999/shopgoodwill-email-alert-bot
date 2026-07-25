@@ -509,14 +509,21 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
 
-        healthy = (
+
+        poll_healthy = (
             last_poll_ok_at is not None
             and (datetime.now(timezone.utc) - last_poll_ok_at).total_seconds()
             < max(POLL_SECONDS * 3, 600)
         )
-        status = 200 if healthy else 503
+
+        # Keep the container healthy while reporting mailbox problems.
+        status = 200
         payload = {
-            "status": "ok" if healthy else "starting_or_unhealthy",
+            "status": "ok" if poll_healthy else "degraded",
+
+
+
+
             "last_poll_ok_at": last_poll_ok_at.isoformat() if last_poll_ok_at else None,
             "last_error": last_error,
             "configuration": env_summary(),
