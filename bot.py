@@ -23,7 +23,7 @@ from get_end_date import get_goodwill_end_date
 from dateutil import parser as date_parser
 
 # --- LOGGING CONFIGURATION ---
-ENABLE_LOGGING = False  # Set to False to disable all logging output
+ENABLE_LOGGING = True  # Set to False to disable all logging output
 LOG_FILE = r"C:\Users\Baggy\aviation-news\goodwill\test scrape\logging.txt"
 
 # Setup logger
