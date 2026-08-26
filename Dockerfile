@@ -8,7 +8,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY bot.py .
+COPY bot.py . .
 
 RUN mkdir -p /data \
     && useradd --create-home --uid 10001 botuser \
