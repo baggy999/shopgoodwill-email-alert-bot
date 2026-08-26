@@ -68,37 +68,39 @@ else:
     log.addHandler(logging.NullHandler())
 # -----------------------------
 
-DATA_DIR = "C:\\Users\\Baggy\\aviation-news\\goodwill\\test scrape"
-DB_PATH = "C:\\Users\\Baggy\\aviation-news\\goodwill\\test scrape\\state.db"
+DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
+DB_PATH = DATA_DIR / "state.db"
 
-IMAP_HOST = "imap.gmail.com"
-IMAP_PORT = 993
-IMAP_USERNAME = "gwbot1235@gmail.com"
-IMAP_PASSWORD = ""
-IMAP_FOLDER = "INBOX"
-IMAP_SENDER_MATCH = "shopgoodwill"
-IMAP_LOOKBACK_DAYS = 3
+IMAP_HOST = os.environ["IMAP_HOST"]
+IMAP_PORT = int(os.getenv("IMAP_PORT", "993"))
+IMAP_USERNAME = os.environ["IMAP_USERNAME"]
+IMAP_PASSWORD = os.environ["IMAP_PASSWORD"]
+IMAP_FOLDER = os.getenv("IMAP_FOLDER", "INBOX")
+IMAP_SENDER_MATCH = os.getenv("IMAP_SENDER_MATCH", "shopgoodwill")
+IMAP_LOOKBACK_DAYS = int(os.getenv("IMAP_LOOKBACK_DAYS", "14"))
 
+SMTP_HOST = os.environ["SMTP_HOST"]
+SMTP_PORT = int(os.getenv("SMTP_PORT", "2525"))
+SMTP_USERNAME = os.getenv("SMTP_USERNAME", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+SMTP_USE_TLS = os.getenv("SMTP_USE_TLS", "true").lower() in {"1", "true", "yes", "on"}
+SMTP_USE_SSL = os.getenv("SMTP_USE_SSL", "false").lower() in {"1", "true", "yes", "on"}
 
-SMTP_HOST = "mail.smtp2go.com"
-SMTP_PORT = 2525
-SMTP_USERNAME = "SMTP_USERNAME", "gwbot"
-SMTP_PASSWORD = "SMTP_PASSWORD", ""
-SMTP_USE_TLS = "true"
-SMTP_USE_SSL = "false"
-ALERT_FROM_EMAIL = "gb"
-ALERT_TO_EMAIL = "admin@planenews.net"
+ALERT_FROM_EMAIL = os.environ["ALERT_FROM_EMAIL"]
+ALERT_TO_EMAIL = os.getenv("ALERT_TO_EMAIL", "admin@planenews.net")
 
 SEARCH_TERMS = [
     item.strip().lower()
     for item in os.getenv("SEARCH_TERMS", "charm,charms").split(",")
     if item.strip()
 ]
-ALERT_MINUTES_BEFORE = 30
-POLL_SECONDS = 1200
-AUCTION_TIMEZONE = "America/Los_Angeles"
-HEALTH_PORT = 8080
-SEND_PARSE_FAILURES = "false"
+ALERT_MINUTES_BEFORE = int(os.getenv("ALERT_MINUTES_BEFORE", "60"))
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "120"))
+AUCTION_TIMEZONE = ZoneInfo(os.getenv("AUCTION_TIMEZONE", "America/Los_Angeles"))
+HEALTH_PORT = int(os.getenv("PORT", "8080"))
+SEND_PARSE_FAILURES = os.getenv("SEND_PARSE_FAILURES", "false").lower() in {
+    "1", "true", "yes", "on"
+}
 
 log.debug(f"Configuration loaded: IMAP_HOST={IMAP_HOST}, SMTP_HOST={SMTP_HOST}")
 log.debug(f"Search terms: {SEARCH_TERMS}, Alert window: {ALERT_MINUTES_BEFORE}m")
