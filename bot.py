@@ -697,7 +697,7 @@ def send_due_alerts() -> None:
 
             if 0 <= minutes_left <= ALERT_MINUTES_BEFORE:
                 log.info(f"⏰ ALERT DUE: {row['title']} - {int(minutes_left)} minutes remaining")
-                local_end = end_time.astimezone(ZoneInfo(AUCTION_TIMEZONE))
+                local_end = end_time.astimezone(AUCTION_TIMEZONE)
                 rounded = max(1, int(round(minutes_left)))
                 try:
                     send_email(
