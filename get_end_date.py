@@ -9,11 +9,14 @@ import random
 import time
 import logging
 from datetime import datetime, timezone
-
+from zoneinfo import ZoneInfo
 import requests
 from dateutil import parser as date_parser
 
 log = logging.getLogger("shopgoodwill-alert-bot")
+
+# ShopGoodwill's API returns timestamps in Pacific Time (PT)
+SG_TZ = ZoneInfo("America/Los_Angeles")
 
 API_URL_TEMPLATE = "https://buyerapi.shopgoodwill.com/api/ItemDetail/GetItemDetailModelByItemId/{item_id}"
 
@@ -105,13 +108,21 @@ def get_goodwill_end_date(url: str, timeout: int = 10) -> datetime | None:
 
     # shopgoodwill's API returns endTime as a UTC timestamp with no offset
     # marker; treat naive values as UTC, and normalize anything else to UTC.
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    else:
-        parsed = parsed.astimezone(timezone.utc)
+    try:
+        parsed = date_parser.parse(raw_end_time)
+    except (ValueError, TypeError, OverflowError) as e:
+        log.warning(f"[get_end_date] Could not parse endTime '{raw_end_time}': {e}")
+        return None
 
-    log.debug(f"[get_end_date] Resolved end time for item {item_id}: {parsed.isoformat()}")
-    return parsed
+    # ShopGoodwill API timestamps represent Pacific Time (America/Los_Angeles)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=SG_TZ)
+    
+    # Normalize to UTC for internal storage
+    parsed_utc = parsed.astimezone(timezone.utc)
+
+    log.debug(f"[get_end_date] Resolved end time for item {item_id}: {parsed_utc.isoformat()}")
+    return parsed_utc
 
 
 if __name__ == "__main__":
