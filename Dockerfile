@@ -5,16 +5,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+# Install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY bot.py . .
+# Copy all project files (including get_end_date.py and bot.py)
+COPY . .
 
-RUN mkdir -p /data \
-    && useradd --create-home --uid 10001 botuser \
-    && chown -R botuser:botuser /app /data
-
-USER botuser
+# Set up open permissions on /data so SQLite can create state.db regardless of mount ownership
+RUN mkdir -p /data && chmod 777 /data
 
 EXPOSE 8080
 
