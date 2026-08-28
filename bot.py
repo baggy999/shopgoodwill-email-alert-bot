@@ -24,7 +24,8 @@ from dateutil import parser as date_parser
 
 # --- LOGGING CONFIGURATION ---
 ENABLE_LOGGING = True  # Set to False to disable all logging output
-LOG_FILE = r"C:\Users\Baggy\aviation-news\goodwill\test scrape\logging.txt"
+DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
+LOG_FILE = os.getenv("LOG_FILE", str(DATA_DIR / "logging.txt"))
 
 # Setup logger
 log = logging.getLogger("shopgoodwill-alert-bot")
@@ -68,7 +69,6 @@ else:
     log.addHandler(logging.NullHandler())
 # -----------------------------
 
-DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
 DB_PATH = DATA_DIR / "state.db"
 
 IMAP_HOST = os.environ["IMAP_HOST"]
@@ -117,7 +117,6 @@ END_LABEL_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Common date/time fragments found in marketplace emails.
 DATE_FRAGMENT_RE = re.compile(
     r"""
     (
@@ -206,6 +205,23 @@ def init_db() -> None:
     log.info("Database initialization complete")
 
 
+def cleanup_expired_auctions() -> None:
+    """Deletes auctions whose end time has already passed."""
+    now_utc = datetime.now(timezone.utc).isoformat()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.execute(
+                "DELETE FROM auctions WHERE end_time_utc < ?",
+                (now_utc,),
+            )
+            deleted_count = cursor.rowcount
+            conn.commit()
+            if deleted_count > 0:
+                log.info(f"🗑️ Cleaned up {deleted_count} expired auction(s) from database")
+    except Exception as e:
+        log.error(f"Failed to cleanup expired auctions: {e}")
+
+
 def message_processed(message_key: str) -> bool:
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(
@@ -231,7 +247,15 @@ def mark_message_processed(message_key: str) -> None:
 
 def save_auction(item_url: str, title: str, end_time: datetime, subject: str) -> bool:
     log.debug(f"Attempting to save auction - URL: {item_url}, Title: {title[:50]}...")
-    end_utc = end_time.astimezone(timezone.utc).isoformat()
+    end_utc = end_time.astimezone(timezone.utc)
+    now_utc = datetime.now(timezone.utc)
+
+    # Don't save auctions that have already ended
+    if end_utc <= now_utc:
+        log.info(f"Skipping auction that already ended in the past: {item_url}")
+        return False
+
+    end_utc_str = end_utc.isoformat()
     
     with sqlite3.connect(DB_PATH) as conn:
         existing = conn.execute(
@@ -241,20 +265,20 @@ def save_auction(item_url: str, title: str, end_time: datetime, subject: str) ->
 
         if existing:
             log.info(f"Auction already exists, updating: {item_url}")
-            log.debug(f"Previous end time: {existing[0]}, New end time: {end_utc}")
+            log.debug(f"Previous end time: {existing[0]}, New end time: {end_utc_str}")
             conn.execute(
                 """
                 UPDATE auctions
                 SET title = ?, end_time_utc = ?, source_subject = ?
                 WHERE item_url = ?
                 """,
-                (title, end_utc, subject, item_url),
+                (title, end_utc_str, subject, item_url),
             )
             conn.commit()
             return False
 
         log.info(f"New auction saved: {item_url}")
-        log.debug(f"End time (UTC): {end_utc}, Title: {title}")
+        log.debug(f"End time (UTC): {end_utc_str}, Title: {title}")
         conn.execute(
             """
             INSERT INTO auctions(
@@ -264,7 +288,7 @@ def save_auction(item_url: str, title: str, end_time: datetime, subject: str) ->
             (
                 item_url,
                 title,
-                end_utc,
+                end_utc_str,
                 subject,
                 datetime.now(timezone.utc).isoformat(),
             ),
@@ -732,33 +756,105 @@ def send_due_alerts() -> None:
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
-        if self.path not in {"/", "/health"}:
-            log.debug(f"Health check 404: {self.path}")
-            self.send_response(404)
+        if self.path == "/health":
+            poll_healthy = (
+                last_poll_ok_at is not None
+                and (datetime.now(timezone.utc) - last_poll_ok_at).total_seconds()
+                < max(POLL_SECONDS * 3, 600)
+            )
+
+            status = 200
+            payload = {
+                "status": "ok" if poll_healthy else "degraded",
+                "last_poll_ok_at": last_poll_ok_at.isoformat() if last_poll_ok_at else None,
+                "last_error": last_error,
+                "configuration": env_summary(),
+            }
+            raw = json_bytes(payload)
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
             self.end_headers()
+            self.wfile.write(raw)
             return
 
-        poll_healthy = (
-            last_poll_ok_at is not None
-            and (datetime.now(timezone.utc) - last_poll_ok_at).total_seconds()
-            < max(POLL_SECONDS * 3, 600)
-        )
+        if self.path in {"/", "/auctions"}:
+            try:
+                with sqlite3.connect(DB_PATH) as conn:
+                    conn.row_factory = sqlite3.Row
+                    rows = conn.execute(
+                        """
+                        SELECT item_url, title, end_time_utc, alerted_at
+                        FROM auctions
+                        ORDER BY end_time_utc ASC
+                        """
+                    ).fetchall()
+            except Exception as e:
+                rows = []
+                log.error(f"Failed to fetch auctions for webpage: {e}")
 
-        log.debug(f"Health check: {'OK' if poll_healthy else 'DEGRADED'}")
+            table_rows = ""
+            for r in rows:
+                title = html.escape(r["title"] or "No Title")
+                url = html.escape(r["item_url"])
+                end_time = r["end_time_utc"]
+                alerted = "✅ Yes" if r["alerted_at"] else "⏳ Pending"
 
-        status = 200
-        payload = {
-            "status": "ok" if poll_healthy else "degraded",
-            "last_poll_ok_at": last_poll_ok_at.isoformat() if last_poll_ok_at else None,
-            "last_error": last_error,
-            "configuration": env_summary(),
-        }
-        raw = json_bytes(payload)
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(raw)))
+                table_rows += f"""
+                <tr>
+                    <td><a href="{url}" target="_blank" rel="noopener noreferrer">{title}</a></td>
+                    <td><code>{end_time}</code></td>
+                    <td>{alerted}</td>
+                </tr>
+                """
+
+            html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tracked Auctions</title>
+    <style>
+        body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f8fafc; padding: 2rem; margin: 0; }}
+        h1 {{ margin-bottom: 0.5rem; }}
+        p {{ color: #94a3b8; margin-bottom: 1.5rem; }}
+        table {{ width: 100%; border-collapse: collapse; background: #1e293b; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); }}
+        th, td {{ padding: 12px 16px; text-align: left; border-bottom: 1px solid #334155; }}
+        th {{ background: #334155; font-weight: 600; text-transform: uppercase; font-size: 0.75rem; letter-spacing: 0.05em; }}
+        tr:hover {{ background: #283548; }}
+        a {{ color: #38bdf8; text-decoration: none; font-weight: 500; }}
+        a:hover {{ text-decoration: underline; }}
+        code {{ background: #0f172a; padding: 2px 6px; border-radius: 4px; font-size: 0.85em; color: #facc15; }}
+    </style>
+</head>
+<body>
+    <h1>Tracked Auctions ({len(rows)})</h1>
+    <p>Live inventory from <code>state.db</code></p>
+    <table>
+        <thead>
+            <tr>
+                <th>Item Title & Link</th>
+                <th>End Time (UTC)</th>
+                <th>Alert Status</th>
+            </tr>
+        </thead>
+        <tbody>
+            {table_rows or '<tr><td colspan="3" style="text-align:center; color:#94a3b8;">No active auctions found in database.</td></tr>'}
+        </tbody>
+    </table>
+</body>
+</html>"""
+
+            encoded = html_content.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+            return
+
+        self.send_response(404)
         self.end_headers()
-        self.wfile.write(raw)
 
     def log_message(self, format: str, *args) -> None:
         return
@@ -770,11 +866,11 @@ def json_bytes(value: dict) -> bytes:
 
 
 def run_health_server() -> None:
-    log.info(f"Starting health endpoint on port {HEALTH_PORT}")
+    log.info(f"Starting web server on port {HEALTH_PORT}")
     server = ThreadingHTTPServer(("0.0.0.0", HEALTH_PORT), HealthHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    log.info(f"Health endpoint listening on port {HEALTH_PORT}")
+    log.info(f"Web server listening on port {HEALTH_PORT}")
 
 
 def handle_shutdown(signum, frame) -> None:
@@ -793,6 +889,7 @@ def main() -> None:
     signal.signal(signal.SIGINT, handle_shutdown)
 
     init_db()
+    cleanup_expired_auctions()
     run_health_server()
     log.info(f"Starting bot: {env_summary()}")
     log.info(f"Logging to: {LOG_FILE}")
@@ -803,6 +900,7 @@ def main() -> None:
         log.debug(f"--- Cycle {cycle_count} ---")
         started = time.monotonic()
         try:
+            cleanup_expired_auctions()
             process_inbox()
             send_due_alerts()
         except Exception as exc:
