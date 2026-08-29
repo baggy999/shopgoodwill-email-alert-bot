@@ -106,15 +106,7 @@ def get_goodwill_end_date(url: str, timeout: int = 10) -> datetime | None:
         log.warning(f"[get_end_date] Could not parse endTime '{raw_end_time}': {e}")
         return None
 
-    # shopgoodwill's API returns endTime as a UTC timestamp with no offset
-    # marker; treat naive values as UTC, and normalize anything else to UTC.
-    try:
-        parsed = date_parser.parse(raw_end_time)
-    except (ValueError, TypeError, OverflowError) as e:
-        log.warning(f"[get_end_date] Could not parse endTime '{raw_end_time}': {e}")
-        return None
-
-    # ShopGoodwill API timestamps represent Pacific Time (America/Los_Angeles)
+    # ShopGoodwill API timestamps represent Pacific Time (America/Los_Angeles) without an offset
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=SG_TZ)
     
