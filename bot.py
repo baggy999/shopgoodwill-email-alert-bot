@@ -206,13 +206,15 @@ def init_db() -> None:
 
 
 def cleanup_expired_auctions() -> None:
-    """Deletes auctions whose end time has already passed."""
-    now_utc = datetime.now(timezone.utc).isoformat()
+    """Deletes auctions whose end time passed more than 30 minutes ago."""
+    # Add a 30-minute buffer so items are never purged before alerting
+    cutoff_utc = (datetime.now(timezone.utc) - timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    
     try:
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.execute(
                 "DELETE FROM auctions WHERE end_time_utc < ?",
-                (now_utc,),
+                (cutoff_utc,),
             )
             deleted_count = cursor.rowcount
             conn.commit()
@@ -255,7 +257,7 @@ def save_auction(item_url: str, title: str, end_time: datetime, subject: str) ->
         log.info(f"Skipping auction that already ended in the past: {item_url}")
         return False
 
-    end_utc_str = end_utc.isoformat()
+    end_utc_str = end_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
     
     with sqlite3.connect(DB_PATH) as conn:
         existing = conn.execute(
