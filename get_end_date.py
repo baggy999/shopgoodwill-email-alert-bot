@@ -106,14 +106,17 @@ def get_goodwill_end_date(url: str, timeout: int = 10) -> datetime | None:
         log.warning(f"[get_end_date] Could not parse endTime '{raw_end_time}': {e}")
         return None
 
-    # ShopGoodwill API timestamps represent Pacific Time (America/Los_Angeles) without an offset
+    # ShopGoodwill API endTime is a naive datetime representing Pacific Time (PT).
+    # Tag it as Pacific Time first:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=SG_TZ)
-    
-    # Normalize to UTC for internal storage
+    else:
+        parsed = parsed.astimezone(SG_TZ)
+
+    # Convert to UTC for consistent database storage
     parsed_utc = parsed.astimezone(timezone.utc)
 
-    log.debug(f"[get_end_date] Resolved end time for item {item_id}: {parsed_utc.isoformat()}")
+    log.info(f"[get_end_date] Item {item_id}: API raw='{raw_end_time}' -> PT={parsed.strftime('%I:%M %p %Z')} -> UTC={parsed_utc.isoformat()}")
     return parsed_utc
 
 
