@@ -109,6 +109,13 @@ ITEM_URL_RE = re.compile(
     r"https?://(?:www\.)?shopgoodwill\.com/item/\d+(?:[^\s<>\"']*)?",
     re.IGNORECASE,
 )
+
+#---- EMAIL SEARCH FOR TITLE-----
+EMAIL_TITLERE = re.compile(
+    r"^[ \t]*Title:\s*(.+)$ ",
+    re.IGNORECASE | re.MULTILINE
+)
+
 TAG_RE = re.compile(r"<[^>]+>")
 WHITESPACE_RE = re.compile(r"[ \t]+")
 
@@ -405,14 +412,32 @@ def extract_item_urls(text: str) -> list[str]:
 
 def infer_title(subject: str, text: str) -> str:
     log.debug("Inferring title from email")
+
+    # Priority 1: Check for explicit "Title: <item name>" from the notification email
+    title_match = EMAIL_TITLE_RE.search(text)
+    if title_match:
+        extracted = title_match.group(1).strip()
+        # Clean up any trailing HTML/markdown remnants
+        extracted = re.sub(r"<[^>]+>", "", extracted).strip()
+        if extracted:
+            log.info(f"[TITLE] Extracted explicit title: {extracted}")
+            return extracted
+
+    # Priority 2: Fallback to scanning lines for search terms (excluding keyword lines)
     for line in text.splitlines():
-        if contains_search_term(line) and 3 <= len(line) <= 180:
-            log.debug(f"Title inferred from text: {line[:60]}...")
-            return line
-    
-    fallback = subject.strip() or "shopgoodwill charm auction"
-    log.debug(f"Using fallback title: {fallback}")
+        cleaned_line = line.strip()
+        # Skip keyword/metadata label lines
+        if re.search(r"\b(?:search|keyword|keywords|category)\b", cleaned_line, re.I):
+            continue
+        if contains_search_term(cleaned_line) and 3 <= len(cleaned_line) <= 180:
+            log.debug(f"[TITLE] Inferred from line content: {cleaned_line[:60]}...")
+            return cleaned_line
+
+    # Priority 3: Fallback to email subject
+    fallback = subject.strip() or "shopgoodwill auction"
+    log.debug(f"[TITLE] Using fallback: {fallback}")
     return fallback
+
 
 
 def parse_end_time(text: str) -> datetime | None:
@@ -577,6 +602,28 @@ def fetch_messages() -> Iterable[tuple[str, email.message.EmailMessage]]:
         raise
 
 
+def extract_item_pairs(text: str) -> dict[str, str]:
+    """
+    Extracts {item_url: title} pairs by looking for blocks containing
+    both 'Title: ...' and an item URL.
+    """
+    url_to_title = {}
+    
+    # Split email body into blocks by blank lines or Item # markers
+    blocks = re.split(r"(?:\r?\n\s*\r?\n|(?=Item\s*#:))", text)
+    for block in blocks:
+        title_m = EMAIL_TITLE_RE.search(block)
+        url_m = ITEM_URL_RE.search(block)
+        if title_m and url_m:
+            url = clean_item_url(html.unescape(url_m.group(0)))
+            title = title_m.group(1).strip()
+            title = re.sub(r"<[^>]+>", "", title).strip()
+            if url and title:
+                url_to_title[url] = title
+
+    return url_to_title
+
+
 def process_inbox() -> None:
     global last_poll_ok_at, last_error
 
@@ -632,24 +679,26 @@ def process_inbox() -> None:
             log.info("✓ Message passed filters - extracting auction details...")
             urls = extract_item_urls(searchable)
             email_end_time = parse_end_time(searchable)
-            title = infer_title(subject, text)
+            item_pairs = extract_item_pairs(text)
+            fallback_title = infer_title(subject, text)
             
             log.info(f"[EXTRACT] URLs found: {len(urls)}")
             log.info(f"[EXTRACT] Email-parsed end time: {email_end_time.isoformat() if email_end_time else 'NONE'}")
-            log.info(f"[EXTRACT] Title: {title[:60]}")
 
-            # === VALIDATION: Check if we have what we need ===
+            # === VALIDATION ===
             if not urls:
                 log.error("❌ [FAIL-URLS] No URLs found. Cannot save auction.")
                 failed_filters["no_urls"] += 1
                 mark_message_processed(message_key)
                 continue
 
-            # === SUCCESS: Resolve end time (API-first) and save each item ===
+            # === SAVE EACH ITEM ===
             log.info("🎯 [SUCCESS] URLs found - resolving end times and saving!")
             for url in urls:
+                # Use block-specific title if matched, else fallback
+                title = item_pairs.get(url, fallback_title)
                 end_time = resolve_end_time(url, email_end_time)
-
+                
                 if not end_time:
                     log.error(f"❌ [FAIL-ENDTIME] Could not determine end time for {url}. Skipping.")
                     failed_filters["no_end_time"] += 1
