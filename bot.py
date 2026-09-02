@@ -27,10 +27,9 @@ ENABLE_LOGGING = True  # Set to False to disable all logging output
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
 LOG_FILE = os.getenv("LOG_FILE", str(DATA_DIR / "logging.txt"))
 
-# Setup logger
 log = logging.getLogger("shopgoodwill-alert-bot")
 log.setLevel(logging.DEBUG)
-log.handlers.clear()  # Clear any existing handlers to prevent duplicates
+log.handlers.clear()
 
 if ENABLE_LOGGING:
     class FlushingFileHandler(logging.FileHandler):
@@ -47,13 +46,11 @@ if ENABLE_LOGGING:
         "%(asctime)s %(levelname)s %(message)s"
     )
 
-    # Console output handler
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(console_formatter)
     log.addHandler(console_handler)
 
-    # File output handler
     try:
         log_path = Path(LOG_FILE)
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -110,9 +107,8 @@ ITEM_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
-#---- EMAIL SEARCH FOR TITLE-----
-EMAIL_TITLERE = re.compile(
-    r"^[ \t]*Title:\s*(.+)$ ",
+EMAIL_TITLE_RE = re.compile(
+    r"^[ \t]*Title:\s*(.+)$",
     re.IGNORECASE | re.MULTILINE
 )
 
@@ -195,8 +191,6 @@ def init_db() -> None:
                 processed_at TEXT NOT NULL
             )
         """)
-        log.debug("Messages table created/verified")
-        
         conn.execute("""
             CREATE TABLE IF NOT EXISTS auctions (
                 item_url TEXT PRIMARY KEY,
@@ -207,16 +201,13 @@ def init_db() -> None:
                 alerted_at TEXT
             )
         """)
-        log.debug("Auctions table created/verified")
         conn.commit()
     log.info("Database initialization complete")
 
 
 def cleanup_expired_auctions() -> None:
     """Deletes auctions whose end time passed more than 30 minutes ago."""
-    # Add a 30-minute buffer so items are never purged before alerting
     cutoff_utc = (datetime.now(timezone.utc) - timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    
     try:
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.execute(
@@ -237,21 +228,16 @@ def message_processed(message_key: str) -> bool:
             "SELECT 1 FROM messages WHERE message_key = ?",
             (message_key,),
         ).fetchone()
-        result = row is not None
-        if result:
-            log.debug(f"Message already processed: {message_key}")
-        return result
+        return row is not None
 
 
 def mark_message_processed(message_key: str) -> None:
-    log.debug(f"Marking message as processed: {message_key}")
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             "INSERT OR IGNORE INTO messages(message_key, processed_at) VALUES (?, ?)",
             (message_key, datetime.now(timezone.utc).isoformat()),
         )
         conn.commit()
-    log.debug("Message marked processed successfully")
 
 
 def save_auction(item_url: str, title: str, end_time: datetime, subject: str) -> bool:
@@ -259,7 +245,6 @@ def save_auction(item_url: str, title: str, end_time: datetime, subject: str) ->
     end_utc = end_time.astimezone(timezone.utc)
     now_utc = datetime.now(timezone.utc)
 
-    # Don't save auctions that have already ended
     if end_utc <= now_utc:
         log.info(f"Skipping auction that already ended in the past: {item_url}")
         return False
@@ -274,7 +259,6 @@ def save_auction(item_url: str, title: str, end_time: datetime, subject: str) ->
 
         if existing:
             log.info(f"Auction already exists, updating: {item_url}")
-            log.debug(f"Previous end time: {existing[0]}, New end time: {end_utc_str}")
             conn.execute(
                 """
                 UPDATE auctions
@@ -287,7 +271,6 @@ def save_auction(item_url: str, title: str, end_time: datetime, subject: str) ->
             return False
 
         log.info(f"New auction saved: {item_url}")
-        log.debug(f"End time (UTC): {end_utc_str}, Title: {title}")
         conn.execute(
             """
             INSERT INTO auctions(
@@ -307,97 +290,63 @@ def save_auction(item_url: str, title: str, end_time: datetime, subject: str) ->
 
 
 def plain_text_from_message(msg: email.message.EmailMessage) -> str:
-    log.debug("Extracting plain text from message")
     parts: list[str] = []
 
     if msg.is_multipart():
-        log.debug("Message is multipart, processing parts...")
-        part_count = 0
         for part in msg.walk():
             content_type = part.get_content_type()
             disposition = (part.get("Content-Disposition") or "").lower()
             
-            if "attachment" in disposition:
-                log.debug(f"Skipping attachment: {content_type}")
+            if "attachment" in disposition or content_type not in {"text/plain", "text/html"}:
                 continue
-            if content_type not in {"text/plain", "text/html"}:
-                log.debug(f"Skipping non-text part: {content_type}")
-                continue
-            
-            part_count += 1
-            log.debug(f"Processing part {part_count}: {content_type}")
             
             try:
                 payload = part.get_content()
-            except Exception as e:
-                log.debug(f"Failed to get content directly, using get_payload: {e}")
+            except Exception:
                 raw = part.get_payload(decode=True) or b""
                 charset = part.get_content_charset() or "utf-8"
                 payload = raw.decode(charset, errors="replace")
             
             if content_type == "text/html":
-                log.debug("Converting HTML to plain text")
-                hrefs = re.findall(
-                    r'href=["\'](https?://[^"\']+)["\']',
-                    payload,
-                    flags=re.IGNORECASE,
-                )
-                log.debug(f"Found {len(hrefs)} URLs in HTML")
+                hrefs = re.findall(r'href=["\'](https?://[^"\']+)["\']', payload, flags=re.I)
                 payload = html.unescape(TAG_RE.sub(" ", payload))
                 if hrefs:
                     payload += "\n" + "\n".join(html.unescape(url) for url in hrefs)
             parts.append(payload)
     else:
-        log.debug("Message is not multipart")
         try:
             payload = msg.get_content()
-        except Exception as e:
-            log.debug(f"Failed to get content, using get_payload: {e}")
+        except Exception:
             raw = msg.get_payload(decode=True) or b""
             charset = msg.get_content_charset() or "utf-8"
             payload = raw.decode(charset, errors="replace")
         
         if msg.get_content_type() == "text/html":
-            log.debug("Converting HTML to plain text")
-            hrefs = re.findall(
-                r'href=["\'](https?://[^"\']+)["\']',
-                payload,
-                flags=re.IGNORECASE,
-            )
-            log.debug(f"Found {len(hrefs)} URLs in HTML")
+            hrefs = re.findall(r'href=["\'](https?://[^"\']+)["\']', payload, flags=re.I)
             payload = html.unescape(TAG_RE.sub(" ", payload))
             if hrefs:
                 payload += "\n" + "\n".join(html.unescape(url) for url in hrefs)
         parts.append(payload)
 
-    text = "\n".join(parts)
-    text = text.replace("\r", "\n")
-    text = "\n".join(
+    text = "\n".join(parts).replace("\r", "\n")
+    return "\n".join(
         WHITESPACE_RE.sub(" ", line).strip()
         for line in text.splitlines()
         if line.strip()
     )
-    log.debug(f"Plain text extraction complete. Length: {len(text)} chars")
-    return text
 
 
 def contains_search_term(text: str) -> bool:
     lowered = text.lower()
-    found = any(re.search(rf"\b{re.escape(term)}\b", lowered) for term in SEARCH_TERMS)
-    if found:
-        log.debug("Search term found in text")
-    return found
+    return any(re.search(rf"\b{re.escape(term)}\b", lowered) for term in SEARCH_TERMS)
 
 
 def clean_item_url(url: str) -> str:
     match = re.search(r"(https?://(?:www\.)?shopgoodwill\.com/item/\d+)", url, re.I)
-    cleaned = match.group(1) if match else url.rstrip(".,);]")
-    log.debug(f"URL cleaned: {url[:60]}... -> {cleaned}")
-    return cleaned
+    return match.group(1) if match else url.rstrip(".,);]")
 
 
 def extract_item_urls(text: str) -> list[str]:
-    log.debug("Extracting item URLs from text")
     seen: set[str] = set()
     urls: list[str] = []
     for match in ITEM_URL_RE.finditer(text):
@@ -405,111 +354,107 @@ def extract_item_urls(text: str) -> list[str]:
         if url not in seen:
             seen.add(url)
             urls.append(url)
-            log.debug(f"URL extracted: {url}")
-    log.info(f"Found {len(urls)} item URL(s)")
     return urls
 
 
 def infer_title(subject: str, text: str) -> str:
-    log.debug("Inferring title from email")
-
-    # Priority 1: Check for explicit "Title: <item name>" from the notification email
+    """Fallback title inference from the raw email text."""
     title_match = EMAIL_TITLE_RE.search(text)
     if title_match:
         extracted = title_match.group(1).strip()
-        # Clean up any trailing HTML/markdown remnants
         extracted = re.sub(r"<[^>]+>", "", extracted).strip()
         if extracted:
-            log.info(f"[TITLE] Extracted explicit title: {extracted}")
             return extracted
 
-    # Priority 2: Fallback to scanning lines for search terms (excluding keyword lines)
+    # Scan for search terms while ignoring metadata/keyword lines
     for line in text.splitlines():
         cleaned_line = line.strip()
-        # Skip keyword/metadata label lines
-        if re.search(r"\b(?:search|keyword|keywords|category)\b", cleaned_line, re.I):
+        if re.search(r"\b(?:search|keyword|keywords|category|ends?|time|item)\b", cleaned_line, re.I):
             continue
         if contains_search_term(cleaned_line) and 3 <= len(cleaned_line) <= 180:
-            log.debug(f"[TITLE] Inferred from line content: {cleaned_line[:60]}...")
             return cleaned_line
 
-    # Priority 3: Fallback to email subject
-    fallback = subject.strip() or "shopgoodwill auction"
-    log.debug(f"[TITLE] Using fallback: {fallback}")
-    return fallback
-
+    return subject.strip() or "shopgoodwill auction"
 
 
 def parse_end_time(text: str) -> datetime | None:
-    log.debug("Parsing auction end time from text")
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     candidate_lines = [line for line in lines if END_LABEL_RE.search(line)]
-    log.debug(f"Found {len(candidate_lines)} lines with end/closing labels")
 
     for line in candidate_lines:
-        log.debug(f"Checking candidate line: {line[:60]}...")
         match = DATE_FRAGMENT_RE.search(line)
-        if not match:
-            log.debug("No date fragment found in candidate")
-            continue
-        parsed = parse_datetime_fragment(match.group(1))
-        if parsed:
-            log.info(f"End time parsed from labeled line: {parsed.isoformat()}")
-            return parsed
+        if match:
+            parsed = parse_datetime_fragment(match.group(1))
+            if parsed:
+                return parsed
 
-    log.debug("Attempting fallback: scanning all lines for nearby dates")
     for index, line in enumerate(lines):
         if END_LABEL_RE.search(line):
             nearby = " ".join(lines[index:index + 3])
-            log.debug(f"Checking nearby text after line {index}: {nearby[:60]}...")
             match = DATE_FRAGMENT_RE.search(nearby)
             if match:
                 parsed = parse_datetime_fragment(match.group(1))
                 if parsed:
-                    log.info(f"End time parsed from nearby text: {parsed.isoformat()}")
                     return parsed
-    
-    log.warning("Could not parse end time from email text")
-    return None
 
-
-def resolve_end_time(item_url: str, fallback: datetime | None) -> datetime | None:
-    api_end_time = get_goodwill_end_date(item_url)
-    if api_end_time:
-        log.info(f"[END-TIME] Using API end time for {item_url}: {api_end_time.isoformat()}")
-        return api_end_time
-
-    if fallback:
-        log.warning(
-            f"[END-TIME] API lookup failed for {item_url}; "
-            f"falling back to email-parsed end time: {fallback.isoformat()}"
-        )
-        return fallback
-
-    log.error(f"[END-TIME] Could not determine end time for {item_url} (API and email parsing both failed)")
     return None
 
 
 def parse_datetime_fragment(value: str) -> datetime | None:
-    log.debug(f"Parsing datetime fragment: {value}")
     value = re.sub(r"(\d)(st|nd|rd|th)\b", r"\1", value, flags=re.I)
     try:
         parsed = date_parser.parse(value, fuzzy=True, tzinfos=TZINFOS)
-        log.debug(f"Successfully parsed: {parsed.isoformat()}")
-    except (ValueError, TypeError, OverflowError) as e:
-        log.debug(f"Failed to parse datetime: {type(e).__name__}: {e}")
+    except (ValueError, TypeError, OverflowError):
         return None
     
     if parsed.tzinfo is None:
-        log.debug(f"No timezone info, using default: {AUCTION_TIMEZONE}")
         parsed = parsed.replace(tzinfo=AUCTION_TIMEZONE)
     
     return parsed
 
 
+def resolve_auction_details(
+    item_url: str, 
+    fallback_dt: datetime | None, 
+    fallback_title: str
+) -> tuple[datetime | None, str]:
+    """
+    Attempts to pull authoritative end time and title from the API.
+    Falls back gracefully to values parsed from the email.
+    """
+    api_end_time, api_title = get_goodwill_end_date(item_url)
+    
+    final_title = api_title if api_title else fallback_title
+    final_end_time = api_end_time if api_end_time else fallback_dt
+
+    if api_end_time:
+        log.info(f"[AUCTION-DETAILS] Using API data for {item_url}: Title='{final_title}', Ends='{final_end_time.isoformat()}'")
+    else:
+        log.warning(f"[AUCTION-DETAILS] API lookup incomplete for {item_url}; using fallback data")
+
+    return final_end_time, final_title
+
+
+def extract_item_pairs(text: str) -> dict[str, str]:
+    """
+    Extracts {item_url: title} blocks when multiple items are listed in one email.
+    """
+    url_to_title = {}
+    blocks = re.split(r"(?:\r?\n\s*\r?\n|(?=Item\s*#:))", text)
+    for block in blocks:
+        title_m = EMAIL_TITLE_RE.search(block)
+        url_m = ITEM_URL_RE.search(block)
+        if title_m and url_m:
+            url = clean_item_url(html.unescape(url_m.group(0)))
+            title = re.sub(r"<[^>]+>", "", title_m.group(1)).strip()
+            if url and title:
+                url_to_title[url] = title
+
+    return url_to_title
+
+
 def send_email(subject: str, body: str) -> None:
     log.info(f"Sending email: {subject}")
-    log.debug(f"To: {ALERT_TO_EMAIL}, From: {ALERT_FROM_EMAIL}")
     
     message = EmailMessage()
     message["From"] = ALERT_FROM_EMAIL
@@ -520,26 +465,19 @@ def send_email(subject: str, body: str) -> None:
     context = ssl.create_default_context()
     try:
         if SMTP_USE_SSL:
-            log.debug(f"Using SMTP_SSL connection to {SMTP_HOST}:{SMTP_PORT}")
-            with smtplib.SMTP_SSL(
-                SMTP_HOST, SMTP_PORT, timeout=30, context=context
-            ) as smtp:
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=30, context=context) as smtp:
                 if SMTP_USERNAME:
-                    log.debug(f"Authenticating with username: {SMTP_USERNAME}")
                     smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
                 smtp.send_message(message)
                 log.info("Email sent successfully via SMTP_SSL")
             return
 
-        log.debug(f"Using SMTP connection to {SMTP_HOST}:{SMTP_PORT}")
         with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as smtp:
             smtp.ehlo()
             if SMTP_USE_TLS:
-                log.debug("Starting TLS")
                 smtp.starttls(context=context)
                 smtp.ehlo()
             if SMTP_USERNAME:
-                log.debug(f"Authenticating with username: {SMTP_USERNAME}")
                 smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
             smtp.send_message(message)
             log.info("Email sent successfully via SMTP")
@@ -549,79 +487,37 @@ def send_email(subject: str, body: str) -> None:
 
 
 def fetch_messages() -> Iterable[tuple[str, email.message.EmailMessage]]:
-    log.info("Fetching messages from IMAP")
     since = datetime.now().astimezone() - timedelta(days=IMAP_LOOKBACK_DAYS)
     since_token = since.strftime("%d-%b-%Y")
-    log.debug(f"Looking for messages since: {since_token}")
 
     try:
         with imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT) as mailbox:
-            log.debug(f"Connected to IMAP: {IMAP_HOST}:{IMAP_PORT}")
             mailbox.login(IMAP_USERNAME, IMAP_PASSWORD)
-            log.debug("IMAP login successful")
-            
             status, _ = mailbox.select(IMAP_FOLDER, readonly=True)
             if status != "OK":
-                log.error(f"Could not select IMAP folder {IMAP_FOLDER!r}")
                 raise RuntimeError(f"Could not select IMAP folder {IMAP_FOLDER!r}")
-            log.debug(f"Selected folder: {IMAP_FOLDER}")
 
             status, data = mailbox.uid("search", None, f'(SINCE "{since_token}")')
             if status != "OK":
-                log.error("IMAP search failed")
                 raise RuntimeError("IMAP search failed")
             
             uids = (data[0] or b"").split()
-            log.info(f"Found {len(uids)} messages in mailbox")
-
             for uid in uids[-250:]:
                 status, message_data = mailbox.uid("fetch", uid, "(BODY.PEEK[])")
                 if status != "OK" or not message_data:
-                    log.warning(f"Could not fetch IMAP UID {uid.decode()}")
                     continue
 
-                raw = next(
-                    (
-                        part[1]
-                        for part in message_data
-                        if isinstance(part, tuple) and len(part) > 1
-                    ),
-                    None,
-                )
+                raw = next((part[1] for part in message_data if isinstance(part, tuple) and len(part) > 1), None)
                 if not raw:
-                    log.warning(f"No raw data for UID {uid.decode()}")
                     continue
 
                 msg = email.message_from_bytes(raw, policy=default)
                 message_id = (msg.get("Message-ID") or "").strip()
                 message_key = message_id or f"imap:{IMAP_FOLDER}:{uid.decode()}"
-                log.debug(f"Processing message: {message_key[:50]}...")
                 yield message_key, msg
     except Exception as e:
         log.error(f"IMAP fetch failed: {type(e).__name__}: {e}")
         raise
-
-
-def extract_item_pairs(text: str) -> dict[str, str]:
-    """
-    Extracts {item_url: title} pairs by looking for blocks containing
-    both 'Title: ...' and an item URL.
-    """
-    url_to_title = {}
-    
-    # Split email body into blocks by blank lines or Item # markers
-    blocks = re.split(r"(?:\r?\n\s*\r?\n|(?=Item\s*#:))", text)
-    for block in blocks:
-        title_m = EMAIL_TITLE_RE.search(block)
-        url_m = ITEM_URL_RE.search(block)
-        if title_m and url_m:
-            url = clean_item_url(html.unescape(url_m.group(0)))
-            title = title_m.group(1).strip()
-            title = re.sub(r"<[^>]+>", "", title).strip()
-            if url and title:
-                url_to_title[url] = title
-
-    return url_to_title
 
 
 def process_inbox() -> None:
@@ -635,83 +531,53 @@ def process_inbox() -> None:
     
     try:
         messages = list(fetch_messages())
-        log.info(f"Total messages fetched: {len(messages)}")
         failed_filters = {"sender": 0, "search_term": 0, "no_urls": 0, "no_end_time": 0}
-        
-        if len(messages) == 0:
-            log.warning("⚠️ NO MESSAGES FETCHED - Check IMAP connection, credentials, and folder")
         
         for message_key, msg in messages:
             processed_count += 1
             
             if message_processed(message_key):
                 skipped_count += 1
-                log.debug(f"[SKIP] Already processed: {message_key[:50]}")
                 continue
 
             sender = str(msg.get("From") or "")
             subject = str(msg.get("Subject") or "")
-            log.info(f"\n[MSG {processed_count}] From: {sender}")
-            log.info(f"[MSG {processed_count}] Subject: {subject}")
-            
             text = plain_text_from_message(msg)
             searchable = f"{subject}\n{text}"
 
-            # === FILTER 1: Sender Check ===
             if IMAP_SENDER_MATCH.lower() not in sender.lower():
-                log.warning(f"[FILTER-FAIL] Sender mismatch: '{sender}' does not contain '{IMAP_SENDER_MATCH}'")
                 mark_message_processed(message_key)
                 failed_filters["sender"] += 1
                 skipped_count += 1
                 continue
-            log.debug("[FILTER-PASS] Sender check passed")
 
-            # === FILTER 2: Search Term Check ===
             if not contains_search_term(searchable):
-                log.warning(f"[FILTER-FAIL] Search terms {SEARCH_TERMS} not found")
                 mark_message_processed(message_key)
                 failed_filters["search_term"] += 1
                 skipped_count += 1
                 continue
-            log.debug("[FILTER-PASS] Search term check passed")
 
-            # === EXTRACTION: URLs and End Time ===
-            log.info("✓ Message passed filters - extracting auction details...")
             urls = extract_item_urls(searchable)
             email_end_time = parse_end_time(searchable)
             item_pairs = extract_item_pairs(text)
             fallback_title = infer_title(subject, text)
-            
-            log.info(f"[EXTRACT] URLs found: {len(urls)}")
-            log.info(f"[EXTRACT] Email-parsed end time: {email_end_time.isoformat() if email_end_time else 'NONE'}")
 
-            # === VALIDATION ===
             if not urls:
-                log.error("❌ [FAIL-URLS] No URLs found. Cannot save auction.")
                 failed_filters["no_urls"] += 1
                 mark_message_processed(message_key)
                 continue
 
-            # === SAVE EACH ITEM ===
-            log.info("🎯 [SUCCESS] URLs found - resolving end times and saving!")
             for url in urls:
-                # Use block-specific title if matched, else fallback
-                title = item_pairs.get(url, fallback_title)
-                end_time = resolve_end_time(url, email_end_time)
+                item_fallback_title = item_pairs.get(url, fallback_title)
+                end_time, title = resolve_auction_details(url, email_end_time, item_fallback_title)
                 
                 if not end_time:
-                    log.error(f"❌ [FAIL-ENDTIME] Could not determine end time for {url}. Skipping.")
                     failed_filters["no_end_time"] += 1
                     if SEND_PARSE_FAILURES:
                         try:
                             send_email(
                                 "[Shopshopgoodwill bot] Parse failure",
-                                (
-                                    f"Could not determine end time (API and email parsing both failed).\n\n"
-                                    f"Subject: {subject}\n"
-                                    f"Item: {url}\n\n"
-                                    f"Body:\n{text[:500]}"
-                                ),
+                                f"Could not determine end time.\n\nSubject: {subject}\nItem: {url}\n\nBody:\n{text[:500]}",
                             )
                         except Exception as e:
                             log.error(f"Failed to send parse failure email: {e}")
@@ -720,17 +586,15 @@ def process_inbox() -> None:
                 created = save_auction(url, title, end_time, subject)
                 if created:
                     new_count += 1
-                    log.info(f"✅ Auction SAVED: {url}")
+                    log.info(f"✅ Auction SAVED: {url} | Title: {title}")
                 else:
-                    log.info(f"⟳ Updated existing: {url}")
+                    log.info(f"⟳ Updated existing: {url} | Title: {title}")
 
             mark_message_processed(message_key)
 
         last_poll_ok_at = datetime.now(timezone.utc)
         last_error = None
-        log.info("=" * 60)
         log.info(f"📊 POLL SUMMARY - Total: {len(messages)}, Processed: {processed_count}, Saved: {new_count}✅")
-        log.info(f"   Filters: Sender:{failed_filters['sender']}, Term:{failed_filters['search_term']}, URLs:{failed_filters['no_urls']}, EndTime:{failed_filters['no_end_time']}")
         log.info("=" * 60)
     except Exception as e:
         last_error = f"{type(e).__name__}: {e}"
@@ -739,7 +603,6 @@ def process_inbox() -> None:
 
 
 def send_due_alerts() -> None:
-    log.debug("Checking for due alerts")
     now = datetime.now(timezone.utc)
     alerts_sent = 0
     
@@ -754,16 +617,11 @@ def send_due_alerts() -> None:
             """
         ).fetchall()
 
-        log.debug(f"Found {len(rows)} auctions awaiting alerts")
-        
         for row in rows:
             end_time = datetime.fromisoformat(row["end_time_utc"])
             minutes_left = (end_time - now).total_seconds() / 60
-            
-            log.debug(f"Auction {row['item_url']}: {minutes_left:.1f} minutes remaining")
 
             if minutes_left < -5:
-                log.debug("Auction ended >5 min ago, marking as alerted (no notification)")
                 conn.execute(
                     "UPDATE auctions SET alerted_at = ? WHERE item_url = ?",
                     (now.isoformat(), row["item_url"]),
@@ -776,7 +634,7 @@ def send_due_alerts() -> None:
                 rounded = max(1, int(round(minutes_left)))
                 try:
                     send_email(
-                        f"[shopgoodwill] Charm ending in {rounded} minutes",
+                        f"[shopgoodwill] Item ending in {rounded} minutes",
                         (
                             f"{row['title']}\n\n"
                             f"Ends: {local_end.strftime('%B %d, %Y at %I:%M %p %Z')}\n"
@@ -798,11 +656,6 @@ def send_due_alerts() -> None:
                 log.info(f"Alert sent and recorded for {row['item_url']}")
 
         conn.commit()
-    
-    if alerts_sent > 0:
-        log.info(f"Alert cycle complete - {alerts_sent} alert(s) sent")
-    else:
-        log.debug("Alert cycle complete - no alerts due")
 
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -921,7 +774,6 @@ def run_health_server() -> None:
     server = ThreadingHTTPServer(("0.0.0.0", HEALTH_PORT), HealthHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    log.info(f"Web server listening on port {HEALTH_PORT}")
 
 
 def handle_shutdown(signum, frame) -> None:
@@ -943,12 +795,10 @@ def main() -> None:
     cleanup_expired_auctions()
     run_health_server()
     log.info(f"Starting bot: {env_summary()}")
-    log.info(f"Logging to: {LOG_FILE}")
 
     cycle_count = 0
     while not shutdown_event.is_set():
         cycle_count += 1
-        log.debug(f"--- Cycle {cycle_count} ---")
         started = time.monotonic()
         try:
             cleanup_expired_auctions()
@@ -960,7 +810,6 @@ def main() -> None:
 
         elapsed = time.monotonic() - started
         wait_time = max(5, POLL_SECONDS - elapsed)
-        log.debug(f"Cycle completed in {elapsed:.1f}s, waiting {wait_time:.1f}s until next cycle")
         shutdown_event.wait(wait_time)
     
     log.info("╔" + "=" * 58 + "╗")
