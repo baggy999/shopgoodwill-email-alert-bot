@@ -198,9 +198,15 @@ def init_db() -> None:
                 end_time_utc TEXT NOT NULL,
                 source_subject TEXT,
                 discovered_at TEXT NOT NULL,
-                alerted_at TEXT
+                alerted_at TEXT,
+                image_url TEXT
             )
         """)
+        # Migrate existing databases that lack image_url
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(auctions)").fetchall()}
+        if "image_url" not in cols:
+            log.info("Migrating auctions table: adding image_url column")
+            conn.execute("ALTER TABLE auctions ADD COLUMN image_url TEXT")
         conn.commit()
     log.info("Database initialization complete")
 
@@ -240,7 +246,13 @@ def mark_message_processed(message_key: str) -> None:
         conn.commit()
 
 
-def save_auction(item_url: str, title: str, end_time: datetime, subject: str) -> bool:
+def save_auction(
+    item_url: str,
+    title: str,
+    end_time: datetime,
+    subject: str,
+    image_url: str | None = None,
+) -> bool:
     log.debug(f"Attempting to save auction - URL: {item_url}, Title: {title[:50]}...")
     end_utc = end_time.astimezone(timezone.utc)
     now_utc = datetime.now(timezone.utc)
@@ -262,10 +274,13 @@ def save_auction(item_url: str, title: str, end_time: datetime, subject: str) ->
             conn.execute(
                 """
                 UPDATE auctions
-                SET title = ?, end_time_utc = ?, source_subject = ?
+                SET title = ?,
+                    end_time_utc = ?,
+                    source_subject = ?,
+                    image_url = COALESCE(?, image_url)
                 WHERE item_url = ?
                 """,
-                (title, end_utc_str, subject, item_url),
+                (title, end_utc_str, subject, image_url, item_url),
             )
             conn.commit()
             return False
@@ -274,8 +289,8 @@ def save_auction(item_url: str, title: str, end_time: datetime, subject: str) ->
         conn.execute(
             """
             INSERT INTO auctions(
-                item_url, title, end_time_utc, source_subject, discovered_at
-            ) VALUES (?, ?, ?, ?, ?)
+                item_url, title, end_time_utc, source_subject, discovered_at, image_url
+            ) VALUES (?, ?, ?, ?, ?, ?)
             """,
             (
                 item_url,
@@ -283,6 +298,7 @@ def save_auction(item_url: str, title: str, end_time: datetime, subject: str) ->
                 end_utc_str,
                 subject,
                 datetime.now(timezone.utc).isoformat(),
+                image_url,
             ),
         )
         conn.commit()
@@ -417,22 +433,25 @@ def resolve_auction_details(
     item_url: str, 
     fallback_dt: datetime | None, 
     fallback_title: str
-) -> tuple[datetime | None, str]:
+) -> tuple[datetime | None, str, str | None]:
     """
-    Attempts to pull authoritative end time and title from the API.
+    Attempts to pull authoritative end time, title, and first image URL from the API.
     Falls back gracefully to values parsed from the email.
     """
-    api_end_time, api_title = get_goodwill_end_date(item_url)
+    api_end_time, api_title, api_image_url = get_goodwill_end_date(item_url)
     
     final_title = api_title if api_title else fallback_title
     final_end_time = api_end_time if api_end_time else fallback_dt
 
     if api_end_time:
-        log.info(f"[AUCTION-DETAILS] Using API data for {item_url}: Title='{final_title}', Ends='{final_end_time.isoformat()}'")
+        log.info(
+            f"[AUCTION-DETAILS] Using API data for {item_url}: "
+            f"Title='{final_title}', Ends='{final_end_time.isoformat()}', Image='{api_image_url}'"
+        )
     else:
         log.warning(f"[AUCTION-DETAILS] API lookup incomplete for {item_url}; using fallback data")
 
-    return final_end_time, final_title
+    return final_end_time, final_title, api_image_url
 
 
 def extract_item_pairs(text: str) -> dict[str, str]:
@@ -453,7 +472,7 @@ def extract_item_pairs(text: str) -> dict[str, str]:
     return url_to_title
 
 
-def send_email(subject: str, body: str) -> None:
+def send_email(subject: str, body: str, html_body: str | None = None) -> None:
     log.info(f"Sending email: {subject}")
     
     message = EmailMessage()
@@ -461,6 +480,8 @@ def send_email(subject: str, body: str) -> None:
     message["To"] = ALERT_TO_EMAIL
     message["Subject"] = subject
     message.set_content(body)
+    if html_body:
+        message.add_alternative(html_body, subtype="html")
 
     context = ssl.create_default_context()
     try:
@@ -569,7 +590,9 @@ def process_inbox() -> None:
 
             for url in urls:
                 item_fallback_title = item_pairs.get(url, fallback_title)
-                end_time, title = resolve_auction_details(url, email_end_time, item_fallback_title)
+                end_time, title, image_url = resolve_auction_details(
+                    url, email_end_time, item_fallback_title
+                )
                 
                 if not end_time:
                     failed_filters["no_end_time"] += 1
@@ -583,7 +606,7 @@ def process_inbox() -> None:
                             log.error(f"Failed to send parse failure email: {e}")
                     continue
 
-                created = save_auction(url, title, end_time, subject)
+                created = save_auction(url, title, end_time, subject, image_url)
                 if created:
                     new_count += 1
                     log.info(f"✅ Auction SAVED: {url} | Title: {title}")
@@ -602,6 +625,52 @@ def process_inbox() -> None:
         raise
 
 
+def build_alert_html(
+    title: str,
+    item_url: str,
+    local_end_str: str,
+    rounded_minutes: int,
+    image_url: str | None,
+) -> str:
+    safe_title = html.escape(title)
+    safe_url = html.escape(item_url)
+    safe_end = html.escape(local_end_str)
+
+    image_block = ""
+    if image_url:
+        safe_img = html.escape(image_url)
+        image_block = f"""
+        <div style="margin: 12px 0;">
+            <a href="{safe_url}" target="_blank" rel="noopener noreferrer">
+                <img src="{safe_img}" alt="{safe_title}"
+                     style="max-width: 320px; width: 100%; height: auto; border-radius: 6px; border: 1px solid #d1d5db; display: block;" />
+            </a>
+        </div>
+        """
+
+    return f"""<!DOCTYPE html>
+<html>
+<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; color: #1f2937; line-height: 1.5;">
+    <h2 style="margin: 0 0 8px 0; font-size: 18px;">
+        <a href="{safe_url}" style="color: #0284c7; text-decoration: none;">{safe_title}</a>
+    </h2>
+    {image_block}
+    <p style="margin: 6px 0;"><strong>Ends:</strong> {safe_end}</p>
+    <p style="margin: 6px 0;"><strong>Time remaining:</strong> about {rounded_minutes} minutes</p>
+    <p style="margin: 12px 0;">
+        <a href="{safe_url}" style="display: inline-block; background: #0284c7; color: #ffffff; padding: 8px 14px; border-radius: 5px; text-decoration: none; font-weight: 600;">
+            Open Auction
+        </a>
+    </p>
+    <hr style="border: none; border-top: 1px solid #e5e7eb; margin: 16px 0;" />
+    <p style="font-size: 12px; color: #6b7280;">
+        This alert was generated from an official shopgoodwill notification email;
+        the bot does not scrape or log into shopgoodwill.
+    </p>
+</body>
+</html>"""
+
+
 def send_due_alerts() -> None:
     now = datetime.now(timezone.utc)
     alerts_sent = 0
@@ -610,7 +679,7 @@ def send_due_alerts() -> None:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """
-            SELECT item_url, title, end_time_utc
+            SELECT item_url, title, end_time_utc, image_url
             FROM auctions
             WHERE alerted_at IS NULL
             ORDER BY end_time_utc
@@ -631,19 +700,42 @@ def send_due_alerts() -> None:
             if 0 <= minutes_left <= ALERT_MINUTES_BEFORE:
                 log.info(f"⏰ ALERT DUE: {row['title']} - {int(minutes_left)} minutes remaining")
                 local_end = end_time.astimezone(AUCTION_TIMEZONE)
+                local_end_str = local_end.strftime('%B %d, %Y at %I:%M %p %Z')
                 rounded = max(1, int(round(minutes_left)))
+
+                # Backfill image_url on the fly if missing from an older DB row
+                image_url = row["image_url"]
+                if not image_url:
+                    _, _, fetched_img = get_goodwill_end_date(row["item_url"])
+                    if fetched_img:
+                        image_url = fetched_img
+                        conn.execute(
+                            "UPDATE auctions SET image_url = ? WHERE item_url = ?",
+                            (image_url, row["item_url"]),
+                        )
+
+                plain_body = (
+                    f"{row['title']}\n\n"
+                    f"Ends: {local_end_str}\n"
+                    f"Time remaining: about {rounded} minutes\n"
+                    f"Open item: {row['item_url']}\n\n"
+                    "This alert was generated from an official shopgoodwill "
+                    "notification email; the bot does not scrape or log into "
+                    "shopgoodwill."
+                )
+                html_body = build_alert_html(
+                    title=row["title"],
+                    item_url=row["item_url"],
+                    local_end_str=local_end_str,
+                    rounded_minutes=rounded,
+                    image_url=image_url,
+                )
+
                 try:
                     send_email(
                         f"[shopgoodwill] Item ending in {rounded} minutes",
-                        (
-                            f"{row['title']}\n\n"
-                            f"Ends: {local_end.strftime('%B %d, %Y at %I:%M %p %Z')}\n"
-                            f"Time remaining: about {rounded} minutes\n"
-                            f"Open item: {row['item_url']}\n\n"
-                            "This alert was generated from an official shopgoodwill "
-                            "notification email; the bot does not scrape or log into "
-                            "shopgoodwill."
-                        ),
+                        plain_body,
+                        html_body=html_body,
                     )
                     alerts_sent += 1
                 except Exception as e:
@@ -688,7 +780,7 @@ class HealthHandler(BaseHTTPRequestHandler):
                     conn.row_factory = sqlite3.Row
                     rows = conn.execute(
                         """
-                        SELECT item_url, title, end_time_utc, alerted_at
+                        SELECT item_url, title, end_time_utc, alerted_at, image_url
                         FROM auctions
                         ORDER BY end_time_utc ASC
                         """
@@ -703,9 +795,17 @@ class HealthHandler(BaseHTTPRequestHandler):
                 url = html.escape(r["item_url"])
                 end_time = r["end_time_utc"]
                 alerted = "✅ Yes" if r["alerted_at"] else "⏳ Pending"
+                img_cell = (
+                    f'<a href="{url}" target="_blank" rel="noopener noreferrer">'
+                    f'<img src="{html.escape(r["image_url"])}" alt="" style="width:56px;height:56px;object-fit:cover;border-radius:4px;" />'
+                    f"</a>"
+                    if r["image_url"]
+                    else "—"
+                )
 
                 table_rows += f"""
                 <tr>
+                    <td>{img_cell}</td>
                     <td><a href="{url}" target="_blank" rel="noopener noreferrer">{title}</a></td>
                     <td><code>{end_time}</code></td>
                     <td>{alerted}</td>
@@ -723,7 +823,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         h1 {{ margin-bottom: 0.5rem; }}
         p {{ color: #94a3b8; margin-bottom: 1.5rem; }}
         table {{ width: 100%; border-collapse: collapse; background: #1e293b; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); }}
-        th, td {{ padding: 12px 16px; text-align: left; border-bottom: 1px solid #334155; }}
+        th, td {{ padding: 12px 16px; text-align: left; border-bottom: 1px solid #334155; vertical-align: middle; }}
         th {{ background: #334155; font-weight: 600; text-transform: uppercase; font-size: 0.75rem; letter-spacing: 0.05em; }}
         tr:hover {{ background: #283548; }}
         a {{ color: #38bdf8; text-decoration: none; font-weight: 500; }}
@@ -737,13 +837,14 @@ class HealthHandler(BaseHTTPRequestHandler):
     <table>
         <thead>
             <tr>
+                <th>Image</th>
                 <th>Item Title & Link</th>
                 <th>End Time (UTC)</th>
                 <th>Alert Status</th>
             </tr>
         </thead>
         <tbody>
-            {table_rows or '<tr><td colspan="3" style="text-align:center; color:#94a3b8;">No active auctions found in database.</td></tr>'}
+            {table_rows or '<tr><td colspan="4" style="text-align:center; color:#94a3b8;">No active auctions found in database.</td></tr>'}
         </tbody>
     </table>
 </body>
@@ -813,7 +914,7 @@ def main() -> None:
         shutdown_event.wait(wait_time)
     
     log.info("╔" + "=" * 58 + "╗")
-    log.info("║" + " BOT SHUTDOWN ".center(58) + "║")
+    log.info("║" + " BOT SHUTDOWN **** ".center(58) + "║")
     log.info("╚" + "=" * 58 + "╝")
 
 

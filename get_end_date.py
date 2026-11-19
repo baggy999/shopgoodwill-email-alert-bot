@@ -1,6 +1,6 @@
 """
-Looks up the authoritative auction end time and title for a shopgoodwill item
-directly from shopgoodwill's own buyer API.
+Looks up the authoritative auction end time, title, and first image URL
+for a shopgoodwill item directly from shopgoodwill's own buyer API.
 """
 
 import html
@@ -55,15 +55,76 @@ def extract_item_id(url: str) -> str | None:
     return match.group(1) if match else None
 
 
-def get_goodwill_end_date(url: str, timeout: int = 10) -> tuple[datetime | None, str | None]:
+def _normalize_image_url(raw_url: str | None, server_prefix: str = "") -> str | None:
+    if not raw_url or not isinstance(raw_url, str):
+        return None
+    cleaned = raw_url.strip().replace("\\", "/")
+    if not cleaned:
+        return None
+    if cleaned.startswith("//"):
+        return f"https:{cleaned}"
+    if cleaned.startswith(("http://", "https://")):
+        return cleaned
+    if server_prefix:
+        prefix = server_prefix.strip().rstrip("/")
+        if prefix.startswith("//"):
+            prefix = f"https:{prefix}"
+        return f"{prefix}/{cleaned.lstrip('/')}"
+    return None
+
+
+def _extract_first_image_url(data: dict) -> str | None:
     """
-    Fetch the authoritative end time and listing title for a shopgoodwill item.
-    Returns (end_time_utc, item_title).
+    Extracts the first listing image URL from ShopGoodwill's ItemDetail JSON payload.
+    Handles direct fields, itemImages arrays, and semicolon-delimited imageUrlString.
+    """
+    server_prefix = data.get("imageServer") or ""
+
+    # 1. Direct primary image field
+    direct = data.get("imageUrl") or data.get("imageURL")
+    normalized = _normalize_image_url(direct, server_prefix)
+    if normalized:
+        return normalized
+
+    # 2. List of image objects or URLs (e.g., itemImages / images)
+    images = data.get("itemImages") or data.get("images") or []
+    if isinstance(images, list) and images:
+        first = images[0]
+        if isinstance(first, dict):
+            candidate = (
+                first.get("url")
+                or first.get("imageUrl")
+                or first.get("imageURL")
+                or first.get("fullImageUrl")
+            )
+            normalized = _normalize_image_url(candidate, server_prefix)
+            if normalized:
+                return normalized
+        elif isinstance(first, str):
+            normalized = _normalize_image_url(first, server_prefix)
+            if normalized:
+                return normalized
+
+    # 3. Semicolon-separated imageUrlString (common in ItemDetailModel)
+    url_string = data.get("imageUrlString")
+    if isinstance(url_string, str) and url_string.strip():
+        first_part = url_string.split(";")[0].strip()
+        normalized = _normalize_image_url(first_part, server_prefix)
+        if normalized:
+            return normalized
+
+    return None
+
+
+def get_goodwill_end_date(url: str, timeout: int = 10) -> tuple[datetime | None, str | None, str | None]:
+    """
+    Fetch the authoritative end time, listing title, and first image URL for a shopgoodwill item.
+    Returns (end_time_utc, item_title, first_image_url).
     """
     item_id = extract_item_id(url)
     if not item_id:
         log.debug(f"[get_end_date] Could not extract item id from URL: {url}")
-        return None, None
+        return None, None, None
 
     api_url = API_URL_TEMPLATE.format(item_id=item_id)
     log.debug(f"[get_end_date] Querying {api_url}")
@@ -74,34 +135,37 @@ def get_goodwill_end_date(url: str, timeout: int = 10) -> tuple[datetime | None,
         response = requests.get(api_url, headers=HEADERS, timeout=timeout)
     except requests.RequestException as e:
         log.warning(f"[get_end_date] Network error fetching {api_url}: {e}")
-        return None, None
+        return None, None, None
 
     if response.status_code != 200:
         log.warning(f"[get_end_date] Unexpected status {response.status_code} for {api_url}")
-        return None, None
+        return None, None, None
 
     try:
         data = response.json()
     except ValueError as e:
         log.warning(f"[get_end_date] Could not decode JSON from {api_url}: {e}")
-        return None, None
+        return None, None, None
 
     # 1. Authoritative title extraction
     api_title = data.get("title") or data.get("itemTitle")
     if api_title:
         api_title = html.unescape(api_title).strip()
 
-    # 2. Authoritative end date extraction
+    # 2. First listing image extraction
+    first_image_url = _extract_first_image_url(data)
+
+    # 3. Authoritative end date extraction
     raw_end_time = data.get("endTime")
     if not raw_end_time:
         log.warning(f"[get_end_date] No 'endTime' field in API response for {api_url}")
-        return None, api_title
+        return None, api_title, first_image_url
 
     try:
         parsed = date_parser.parse(raw_end_time)
     except (ValueError, TypeError, OverflowError) as e:
         log.warning(f"[get_end_date] Could not parse endTime '{raw_end_time}': {e}")
-        return None, api_title
+        return None, api_title, first_image_url
 
     # ShopGoodwill API timestamps represent Pacific Time (PT)
     if parsed.tzinfo is None:
@@ -112,13 +176,17 @@ def get_goodwill_end_date(url: str, timeout: int = 10) -> tuple[datetime | None,
     # Convert to UTC for internal storage
     parsed_utc = parsed.astimezone(timezone.utc)
 
-    log.debug(f"[get_end_date] Item {item_id}: Title='{api_title}' -> EndTime(UTC)={parsed_utc.isoformat()}")
-    return parsed_utc, api_title
+    log.debug(
+        f"[get_end_date] Item {item_id}: Title='{api_title}' -> "
+        f"EndTime(UTC)={parsed_utc.isoformat()}, Image={first_image_url}"
+    )
+    return parsed_utc, api_title, first_image_url
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [DEBUG] %(message)s", datefmt="%H:%M:%S")
     target_url = "https://shopgoodwill.com/item/274593484"
-    end_date, title = get_goodwill_end_date(target_url)
+    end_date, title, img_url = get_goodwill_end_date(target_url)
     print(f"Title: {title}")
     print(f"Ends On: {end_date}")
+    print(f"First Image: {img_url}")
