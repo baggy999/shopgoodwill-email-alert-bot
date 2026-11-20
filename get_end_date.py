@@ -1,6 +1,6 @@
 """
-Looks up the authoritative auction end time, title, and first image URL
-for a shopgoodwill item directly from shopgoodwill's own buyer API.
+Looks up the authoritative auction end time, title, first image URL,
+and current bid price for a shopgoodwill item directly from shopgoodwill's own buyer API.
 """
 
 import html
@@ -116,15 +116,33 @@ def _extract_first_image_url(data: dict) -> str | None:
     return None
 
 
-def get_goodwill_end_date(url: str, timeout: int = 10) -> tuple[datetime | None, str | None, str | None]:
+def _extract_current_price(data: dict) -> str | None:
     """
-    Fetch the authoritative end time, listing title, and first image URL for a shopgoodwill item.
-    Returns (end_time_utc, item_title, first_image_url).
+    Extracts and formats the current bid price from ShopGoodwill's ItemDetail JSON payload.
+    """
+    for key in ("currentPrice", "CurrentPrice", "minimumBid", "startingPrice"):
+        val = data.get(key)
+        if val is not None and val != "":
+            try:
+                amount = float(str(val).replace("$", "").replace(",", "").strip())
+                return f"${amount:,.2f}"
+            except (ValueError, TypeError):
+                continue
+    return None
+
+
+def get_goodwill_end_date(
+    url: str, timeout: int = 10
+) -> tuple[datetime | None, str | None, str | None, str | None]:
+    """
+    Fetch the authoritative end time, listing title, first image URL, and current bid price
+    for a shopgoodwill item.
+    Returns (end_time_utc, item_title, first_image_url, current_price).
     """
     item_id = extract_item_id(url)
     if not item_id:
         log.debug(f"[get_end_date] Could not extract item id from URL: {url}")
-        return None, None, None
+        return None, None, None, None
 
     api_url = API_URL_TEMPLATE.format(item_id=item_id)
     log.debug(f"[get_end_date] Querying {api_url}")
@@ -135,37 +153,38 @@ def get_goodwill_end_date(url: str, timeout: int = 10) -> tuple[datetime | None,
         response = requests.get(api_url, headers=HEADERS, timeout=timeout)
     except requests.RequestException as e:
         log.warning(f"[get_end_date] Network error fetching {api_url}: {e}")
-        return None, None, None
+        return None, None, None, None
 
     if response.status_code != 200:
         log.warning(f"[get_end_date] Unexpected status {response.status_code} for {api_url}")
-        return None, None, None
+        return None, None, None, None
 
     try:
         data = response.json()
     except ValueError as e:
         log.warning(f"[get_end_date] Could not decode JSON from {api_url}: {e}")
-        return None, None, None
+        return None, None, None, None
 
     # 1. Authoritative title extraction
     api_title = data.get("title") or data.get("itemTitle")
     if api_title:
         api_title = html.unescape(api_title).strip()
 
-    # 2. First listing image extraction
+    # 2. First listing image & current bid price extraction
     first_image_url = _extract_first_image_url(data)
+    current_price = _extract_current_price(data)
 
     # 3. Authoritative end date extraction
     raw_end_time = data.get("endTime")
     if not raw_end_time:
         log.warning(f"[get_end_date] No 'endTime' field in API response for {api_url}")
-        return None, api_title, first_image_url
+        return None, api_title, first_image_url, current_price
 
     try:
         parsed = date_parser.parse(raw_end_time)
     except (ValueError, TypeError, OverflowError) as e:
         log.warning(f"[get_end_date] Could not parse endTime '{raw_end_time}': {e}")
-        return None, api_title, first_image_url
+        return None, api_title, first_image_url, current_price
 
     # ShopGoodwill API timestamps represent Pacific Time (PT)
     if parsed.tzinfo is None:
@@ -177,16 +196,17 @@ def get_goodwill_end_date(url: str, timeout: int = 10) -> tuple[datetime | None,
     parsed_utc = parsed.astimezone(timezone.utc)
 
     log.debug(
-        f"[get_end_date] Item {item_id}: Title='{api_title}' -> "
+        f"[get_end_date] Item {item_id}: Title='{api_title}', Price={current_price} -> "
         f"EndTime(UTC)={parsed_utc.isoformat()}, Image={first_image_url}"
     )
-    return parsed_utc, api_title, first_image_url
+    return parsed_utc, api_title, first_image_url, current_price
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [DEBUG] %(message)s", datefmt="%H:%M:%S")
     target_url = "https://shopgoodwill.com/item/274593484"
-    end_date, title, img_url = get_goodwill_end_date(target_url)
+    end_date, title, img_url, price = get_goodwill_end_date(target_url)
     print(f"Title: {title}")
+    print(f"Current Bid: {price}")
     print(f"Ends On: {end_date}")
     print(f"First Image: {img_url}")

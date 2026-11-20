@@ -199,14 +199,18 @@ def init_db() -> None:
                 source_subject TEXT,
                 discovered_at TEXT NOT NULL,
                 alerted_at TEXT,
-                image_url TEXT
+                image_url TEXT,
+                current_price TEXT
             )
         """)
-        # Migrate existing databases that lack image_url
+        # Migrate existing databases that lack image_url or current_price
         cols = {row[1] for row in conn.execute("PRAGMA table_info(auctions)").fetchall()}
         if "image_url" not in cols:
             log.info("Migrating auctions table: adding image_url column")
             conn.execute("ALTER TABLE auctions ADD COLUMN image_url TEXT")
+        if "current_price" not in cols:
+            log.info("Migrating auctions table: adding current_price column")
+            conn.execute("ALTER TABLE auctions ADD COLUMN current_price TEXT")
         conn.commit()
     log.info("Database initialization complete")
 
@@ -252,6 +256,7 @@ def save_auction(
     end_time: datetime,
     subject: str,
     image_url: str | None = None,
+    current_price: str | None = None,
 ) -> bool:
     log.debug(f"Attempting to save auction - URL: {item_url}, Title: {title[:50]}...")
     end_utc = end_time.astimezone(timezone.utc)
@@ -277,10 +282,11 @@ def save_auction(
                 SET title = ?,
                     end_time_utc = ?,
                     source_subject = ?,
-                    image_url = COALESCE(?, image_url)
+                    image_url = COALESCE(?, image_url),
+                    current_price = COALESCE(?, current_price)
                 WHERE item_url = ?
                 """,
-                (title, end_utc_str, subject, image_url, item_url),
+                (title, end_utc_str, subject, image_url, current_price, item_url),
             )
             conn.commit()
             return False
@@ -289,8 +295,8 @@ def save_auction(
         conn.execute(
             """
             INSERT INTO auctions(
-                item_url, title, end_time_utc, source_subject, discovered_at, image_url
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                item_url, title, end_time_utc, source_subject, discovered_at, image_url, current_price
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 item_url,
@@ -299,6 +305,7 @@ def save_auction(
                 subject,
                 datetime.now(timezone.utc).isoformat(),
                 image_url,
+                current_price,
             ),
         )
         conn.commit()
@@ -433,12 +440,12 @@ def resolve_auction_details(
     item_url: str, 
     fallback_dt: datetime | None, 
     fallback_title: str
-) -> tuple[datetime | None, str, str | None]:
+) -> tuple[datetime | None, str, str | None, str | None]:
     """
-    Attempts to pull authoritative end time, title, and first image URL from the API.
-    Falls back gracefully to values parsed from the email.
+    Attempts to pull authoritative end time, title, first image URL, and current price
+    from the API. Falls back gracefully to values parsed from the email.
     """
-    api_end_time, api_title, api_image_url = get_goodwill_end_date(item_url)
+    api_end_time, api_title, api_image_url, api_price = get_goodwill_end_date(item_url)
     
     final_title = api_title if api_title else fallback_title
     final_end_time = api_end_time if api_end_time else fallback_dt
@@ -446,12 +453,12 @@ def resolve_auction_details(
     if api_end_time:
         log.info(
             f"[AUCTION-DETAILS] Using API data for {item_url}: "
-            f"Title='{final_title}', Ends='{final_end_time.isoformat()}', Image='{api_image_url}'"
+            f"Title='{final_title}', Price='{api_price}', Ends='{final_end_time.isoformat()}', Image='{api_image_url}'"
         )
     else:
         log.warning(f"[AUCTION-DETAILS] API lookup incomplete for {item_url}; using fallback data")
 
-    return final_end_time, final_title, api_image_url
+    return final_end_time, final_title, api_image_url, api_price
 
 
 def extract_item_pairs(text: str) -> dict[str, str]:
@@ -590,7 +597,7 @@ def process_inbox() -> None:
 
             for url in urls:
                 item_fallback_title = item_pairs.get(url, fallback_title)
-                end_time, title, image_url = resolve_auction_details(
+                end_time, title, image_url, current_price = resolve_auction_details(
                     url, email_end_time, item_fallback_title
                 )
                 
@@ -606,12 +613,12 @@ def process_inbox() -> None:
                             log.error(f"Failed to send parse failure email: {e}")
                     continue
 
-                created = save_auction(url, title, end_time, subject, image_url)
+                created = save_auction(url, title, end_time, subject, image_url, current_price)
                 if created:
                     new_count += 1
-                    log.info(f"✅ Auction SAVED: {url} | Title: {title}")
+                    log.info(f"✅ Auction SAVED: {url} | Title: {title} | Bid: {current_price}")
                 else:
-                    log.info(f"⟳ Updated existing: {url} | Title: {title}")
+                    log.info(f"⟳ Updated existing: {url} | Title: {title} | Bid: {current_price}")
 
             mark_message_processed(message_key)
 
@@ -631,10 +638,12 @@ def build_alert_html(
     local_end_str: str,
     rounded_minutes: int,
     image_url: str | None,
+    current_price: str | None = None,
 ) -> str:
     safe_title = html.escape(title)
     safe_url = html.escape(item_url)
     safe_end = html.escape(local_end_str)
+    safe_price = html.escape(current_price) if current_price else "Unavailable"
 
     image_block = ""
     if image_url:
@@ -655,6 +664,7 @@ def build_alert_html(
         <a href="{safe_url}" style="color: #0284c7; text-decoration: none;">{safe_title}</a>
     </h2>
     {image_block}
+    <p style="margin: 6px 0;"><strong>Current Bid:</strong> {safe_price}</p>
     <p style="margin: 6px 0;"><strong>Ends:</strong> {safe_end}</p>
     <p style="margin: 6px 0;"><strong>Time remaining:</strong> about {rounded_minutes} minutes</p>
     <p style="margin: 12px 0;">
@@ -679,7 +689,7 @@ def send_due_alerts() -> None:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """
-            SELECT item_url, title, end_time_utc, image_url
+            SELECT item_url, title, end_time_utc, image_url, current_price
             FROM auctions
             WHERE alerted_at IS NULL
             ORDER BY end_time_utc
@@ -703,19 +713,24 @@ def send_due_alerts() -> None:
                 local_end_str = local_end.strftime('%B %d, %Y at %I:%M %p %Z')
                 rounded = max(1, int(round(minutes_left)))
 
-                # Backfill image_url on the fly if missing from an older DB row
+                # Refresh image_url and live current_price right before sending the alert
                 image_url = row["image_url"]
-                if not image_url:
-                    _, _, fetched_img = get_goodwill_end_date(row["item_url"])
-                    if fetched_img:
-                        image_url = fetched_img
-                        conn.execute(
-                            "UPDATE auctions SET image_url = ? WHERE item_url = ?",
-                            (image_url, row["item_url"]),
-                        )
+                current_price = row["current_price"]
+                _, _, fetched_img, fetched_price = get_goodwill_end_date(row["item_url"])
+                if fetched_img:
+                    image_url = fetched_img
+                if fetched_price:
+                    current_price = fetched_price
+                if fetched_img or fetched_price:
+                    conn.execute(
+                        "UPDATE auctions SET image_url = ?, current_price = ? WHERE item_url = ?",
+                        (image_url, current_price, row["item_url"]),
+                    )
 
+                price_display = current_price or "Unavailable"
                 plain_body = (
                     f"{row['title']}\n\n"
+                    f"Current Bid: {price_display}\n"
                     f"Ends: {local_end_str}\n"
                     f"Time remaining: about {rounded} minutes\n"
                     f"Open item: {row['item_url']}\n\n"
@@ -729,11 +744,12 @@ def send_due_alerts() -> None:
                     local_end_str=local_end_str,
                     rounded_minutes=rounded,
                     image_url=image_url,
+                    current_price=current_price,
                 )
 
                 try:
                     send_email(
-                        f"[shopgoodwill] Item ending in {rounded} minutes",
+                        f"[shopgoodwill] Item ending in {rounded} minutes ({price_display})",
                         plain_body,
                         html_body=html_body,
                     )
@@ -780,7 +796,7 @@ class HealthHandler(BaseHTTPRequestHandler):
                     conn.row_factory = sqlite3.Row
                     rows = conn.execute(
                         """
-                        SELECT item_url, title, end_time_utc, alerted_at, image_url
+                        SELECT item_url, title, end_time_utc, alerted_at, image_url, current_price
                         FROM auctions
                         ORDER BY end_time_utc ASC
                         """
@@ -793,6 +809,7 @@ class HealthHandler(BaseHTTPRequestHandler):
             for r in rows:
                 title = html.escape(r["title"] or "No Title")
                 url = html.escape(r["item_url"])
+                price = html.escape(r["current_price"] or "—")
                 end_time = r["end_time_utc"]
                 alerted = "✅ Yes" if r["alerted_at"] else "⏳ Pending"
                 img_cell = (
@@ -807,6 +824,7 @@ class HealthHandler(BaseHTTPRequestHandler):
                 <tr>
                     <td>{img_cell}</td>
                     <td><a href="{url}" target="_blank" rel="noopener noreferrer">{title}</a></td>
+                    <td><strong>{price}</strong></td>
                     <td><code>{end_time}</code></td>
                     <td>{alerted}</td>
                 </tr>
@@ -839,12 +857,13 @@ class HealthHandler(BaseHTTPRequestHandler):
             <tr>
                 <th>Image</th>
                 <th>Item Title & Link</th>
+                <th>Current Bid</th>
                 <th>End Time (UTC)</th>
                 <th>Alert Status</th>
             </tr>
         </thead>
         <tbody>
-            {table_rows or '<tr><td colspan="4" style="text-align:center; color:#94a3b8;">No active auctions found in database.</td></tr>'}
+            {table_rows or '<tr><td colspan="5" style="text-align:center; color:#94a3b8;">No active auctions found in database.</td></tr>'}
         </tbody>
     </table>
 </body>

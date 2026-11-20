@@ -14,7 +14,7 @@ from bot import (
     parse_end_time,
     resolve_auction_details,
 )
-from get_end_date import _extract_first_image_url
+from get_end_date import _extract_current_price, _extract_first_image_url
 
 SAMPLE = """
 Vintage Sterling Silver Heart Charm
@@ -32,7 +32,7 @@ assert parsed.month == 7
 assert parsed.day == 25
 assert parsed.hour == 19
 
-# 2. Image URL extraction from API payload variations
+# 2. Image URL & current price extraction from API payload variations
 assert (
     _extract_first_image_url({"imageUrl": "//cdn.shopgoodwill.com/img1.jpg"})
     == "https://cdn.shopgoodwill.com/img1.jpg"
@@ -54,13 +54,19 @@ assert (
 )
 assert _extract_first_image_url({}) is None
 
-# 3. 3-tuple return from resolve_auction_details & HTML email embedding
+assert _extract_current_price({"currentPrice": 42.5}) == "$42.50"
+assert _extract_current_price({"currentPrice": 1250}) == "$1,250.00"
+assert _extract_current_price({"minimumBid": "14.99"}) == "$14.99"
+assert _extract_current_price({}) is None
+
+# 3. 4-tuple return from resolve_auction_details & HTML email embedding
 mock_img = "https://cdn.shopgoodwill.com/items/charm.jpg"
+mock_price = "$42.50"
 with patch(
     "bot.get_goodwill_end_date",
-    return_value=(parsed, "API Vintage Sterling Silver Heart Charm", mock_img),
+    return_value=(parsed, "API Vintage Sterling Silver Heart Charm", mock_img, mock_price),
 ):
-    end_dt, title, img_url = resolve_auction_details(
+    end_dt, title, img_url, price = resolve_auction_details(
         "https://shopgoodwill.com/item/123456789",
         parsed,
         "Fallback Title",
@@ -68,6 +74,7 @@ with patch(
     assert end_dt == parsed
     assert title == "API Vintage Sterling Silver Heart Charm"
     assert img_url == mock_img
+    assert price == mock_price
 
 html_with_img = build_alert_html(
     title=title,
@@ -75,8 +82,10 @@ html_with_img = build_alert_html(
     local_end_str="July 25, 2026 at 07:45 PM PDT",
     rounded_minutes=45,
     image_url=img_url,
+    current_price=price,
 )
 assert f'<img src="{mock_img}"' in html_with_img
+assert "<strong>Current Bid:</strong> $42.50" in html_with_img
 
 html_without_img = build_alert_html(
     title=title,
@@ -84,7 +93,9 @@ html_without_img = build_alert_html(
     local_end_str="July 25, 2026 at 07:45 PM PDT",
     rounded_minutes=45,
     image_url=None,
+    current_price=None,
 )
 assert "<img " not in html_without_img
+assert "<strong>Current Bid:</strong> Unavailable" in html_without_img
 
-print("Parser & image alert tests passed:", parsed.isoformat())
+print("Parser, image & bid price alert tests passed:", parsed.isoformat())
